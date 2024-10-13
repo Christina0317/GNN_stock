@@ -138,6 +138,26 @@ class DataProcess:
         return normalized_data
 
 
+class TimeseriesDataset:
+    def __init__(self, data, x_seq_len=5, y_seq_len=5):
+        self.x = data
+        self.y = data
+        self.x_seq_len = x_seq_len
+        self.y_seq_len = y_seq_len
+        self.x_timeseries, self.y_timeseries = self.get_series_data()
+
+    def get_series_data(self):
+        x_list = []
+        y_list = []
+        for i in range(self.x_seq_len, len(self.x) - self.y_seq_len + 1):
+            x_list.append(self.x[i-self.x_seq_len:i])
+            y_list.append(self.y[i:i + self.y_seq_len])
+        # Convert lists to tensors
+        x_tensor = torch.stack(x_list)
+        y_tensor = torch.stack(y_list)
+        return x_tensor, y_tensor
+
+
 if __name__ == '__main__':
     # qlib
     # stock_data = StockData(

@@ -13,7 +13,6 @@ class FeatureType(IntEnum):
     LOW = 3
     VOLUME = 4
     VWAP = 5
-    RETURN = 6
 
 
 class StockData:
@@ -23,7 +22,7 @@ class StockData:
                  max_backtrack_days: int = 100,
                  max_future_days: int = 30,
                  features: Optional[List[FeatureType]] = None,
-                 path: str = '/Volumes/E/quant_internship_sgd/data/db_jq_candle_minute_w_nan.h5',
+                 path: str = '/Volumes/E/quant_data/db_jq_candle_minute_w_nan.h5',
                  device: torch.device = torch.device('cpu')
                  ):
         self._start_date = start_date
@@ -34,8 +33,15 @@ class StockData:
         # self.features = [f.name.lower() for f in features]
         self.features = features if features is not None else list(FeatureType)
         self.path = path
-        self.stock_ids = None
+        self.stock_ids = self.get_stock_ids()
         self.dates = None
+
+    def get_stock_ids(self):
+        path = '/Volumes/E/quant_data/'
+        stock_ids_path = path + 'stock_ids_hs300.txt'
+        with open(stock_ids_path, 'r') as file:
+            stock_ids = [line.strip() for line in file.readlines()]
+        return stock_ids
 
     def daily_data_from_h5(self):
         with h5py.File(self.path, 'r') as file:
@@ -44,17 +50,18 @@ class StockData:
         daily_data = pd.DataFrame()
         for date in dates:
             data = pd.read_hdf(self.path, key=date)
-            data = data.groupby('code').apply(lambda x: x.iloc[-1], include_groups=False)
-            data['time'] = data['time'].dt.strftime("%Y-%m-%d")   # data.columns = ['code', 'time', 'open'...]
+            data = data.groupby('code').apply(lambda x: x.iloc[-1])
+            data['time'] = data['time'].dt.strftime("%Y-%m-%d")   # data.columns = ['time', 'open'...], data.index = ['code']
             # 筛选 feature
             data = data[['time'] + [f.name.lower() for f in self.features]]
-            data = data.reset_index()
+            data = data.reset_index()    # data.columns = ['code', 'time', 'open'...]
             data = data.melt(id_vars=['code', 'time'], var_name='feature', value_name='value')
-            data.set_index(['time', 'feature', 'code'], inplace=True)
+            data.set_index(['time', 'feature', 'code'], inplace=True)   # data.index=['date', 'feature', 'code']
             data = data['value'].unstack(level='code')
             daily_data = pd.concat([daily_data, data])
 
-        self.stock_ids = daily_data.columns
+        self.stock_ids = [col for col in self.stock_ids if col in daily_data.columns]
+        daily_data = daily_data[self.stock_ids]
         self.dates = dates
         return daily_data
 
@@ -92,8 +99,8 @@ class StockData:
 
 if __name__ == '__main__':
     stock_data = StockData(
-        start_date='20230301',
-        end_date='20230501',
+        start_date='20221201',
+        end_date='20221231',
         features=[FeatureType.OPEN, FeatureType.CLOSE]
         )
     data = stock_data.daily_data_from_h5()

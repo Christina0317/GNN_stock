@@ -1,82 +1,57 @@
 # import os
 # os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 import torch
-import torch.optim as optim
-import torch.nn as nn
-from model import DynamicGNN
+from model import *
+from edge_model import EdgeInfo
 from data_local import FeatureType, StockData
-from data_process import DataProcess
-from clustering import Clustering
+from data_process import DataProcess, TimeseriesDataset
 from tqdm import tqdm
-from multiprocessing import Pool
-import matplotlib.pyplot as plt
-import numpy as np
 import datetime
+from torch.utils.data import DataLoader, TensorDataset
 
 
 class TrainProcess:
-    def __init__(self, data, return_data, num_epochs):   # data -> tensor[time_steps, features, stocks]
-        self.num_features = data.size(1)
-        self.num_stocks = data.size(2)
-        self.num_steps = data.size(0)
-        self.data = data
-        self.last_m = 100   # 聚类的时候取过去的时间步长
+    """
+    feature_data: dataframe -> [len(dates)/features, num_stocks]
+    return_data: dataframe -> [len(dates)/return, num_stocks]
+    features: list[FeatureType]
+    dates: list[str]
+    stock_ids: index
+    num_epochs: int
+    batch_size: int
+
+    Parameter of class
+    feature_tensor: tensor -> [len(dates), len(features), num_stocks]
+    return_tensor: tensor -> [len(dates), num_stocks]
+    """
+    def __init__(self, feature_data, return_data, features, dates, stock_ids, num_epochs, batch_size):
+        self.feature_data = feature_data
+        self.num_features = len(features)
+        self.num_stocks = None   # 去除了都是nan的列
+        self.num_steps = None    # 去除了都是nan的行
         self.num_epochs = num_epochs
         self.return_data = return_data
+        self.features = features
+        self.dates = dates
+        self.stock_ids = stock_ids  # 未删除列之前的 stock index
+        self.batch_size = batch_size
 
-    def generate_edge_info(self, labels):
-        """
-        将分层聚类算法得到的labels整合到edge index/edge weight中
-        :return:
-        """
-        edge_index = []
-        edge_weight = []
-        for i in range(self.num_stocks):
-            for j in range(i + 1, self.num_stocks):
-                if labels[i] == labels[j]:  # 如果两个股票在同一个类别
-                    edge_index.append((i, j))
-                    edge_weight.append(1)
+        self.feature_tensor, self.return_tensor = self.data_cleaning()
 
-        edge_index = torch.tensor(edge_index).t().contiguous()
-        edge_weight = torch.tensor(edge_weight, dtype=torch.float)
-        return edge_index, edge_weight
+    def data_cleaning(self):
+        start_time = datetime.datetime.now()
+        dp = DataProcess(self.feature_data, self.return_data, self.features, self.dates, self.stock_ids)
+        self.feature_data = self.feature_data.drop(columns=dp.over_threshold_stocks)  # data -> dataframe
+        data1 = dp.data1[:, :, :]
+        data2 = dp.data2[:, :]
+        self.num_stocks = data1.size(2)
+        self.num_steps = data1.size(0)
+        self.stock_ids = self.feature_data.columns   # 删除列之后的 stock index
+        end_time = datetime.datetime.now()
+        print('Data is cleaned successfully. Used time is', end_time - start_time)
+        return data1, data2
 
-    def edge_info(self, cluster_threshold):
-        """
-        将 generate_edge_info 得到的 edge index/edge weight 整理
-        :return:
-        """
-        tasks = []
-
-        for t in range(self.num_steps):
-            # 每last_m步或在时间序列开始时进行聚类
-            if t % self.last_m == 0 or t < self.last_m:
-                # 计算窗口数据的开始索引，确保不会有负索引
-                start_index = max(0, t - self.last_m)
-                window_data = self.data[start_index:t + 1]  # 提取窗口数据
-                tasks.append((window_data, cluster_threshold))
-
-        # 使用 multiprocessing 进行并行聚类计算
-        with Pool(processes=4) as pool:  # 调整进程数以适应您的系统
-            clustering_results = pool.starmap(Clustering.hierarchical_cluster, tasks)
-
-        edge_indices = []
-        edge_weights = []
-
-        # 使用聚类结果生成边信息
-        for t in range(self.num_steps):
-            i = 0
-            if t % self.last_m == 0 or t < self.last_m:
-                labels = clustering_results[i]
-                i += 1
-
-            edge_index, edge_weight = self.generate_edge_info(labels)
-            edge_indices.append(edge_index)
-            edge_weights.append(edge_weight)
-
-        return edge_indices, edge_weights
-
-    def apply_to_model(self):
+    def train_dynamic_gnn(self):
         """
         将分层聚类算法和 dynamic GNN 相结合
         :return:
@@ -84,13 +59,15 @@ class TrainProcess:
         # generate edge information
         start_time = datetime.datetime.now()
         cluster_threshold = 5
-        edge_indices, edge_weights = self.edge_info(cluster_threshold)
+        edgeinfo = EdgeInfo(self.feature_tensor)
+        # edge_indices, edge_weights = edgeinfo.fully_connected_edge_info()
+        edge_indices, edge_weights = edgeinfo.edge_info(cluster_threshold)
         end_time = datetime.datetime.now()
         print('The edge information is generated successfully. Used time is ', end_time-start_time)
 
         start_time = datetime.datetime.now()
         # init model
-        model = DynamicGNN(self.data, edge_indices, edge_weights, consider_time_steps=10)
+        model = DynamicGNN(self.feature_tensor, edge_indices, edge_weights, consider_time_steps=10)
         # init optimizer
         criterion = nn.MSELoss()  # 使用均方误差作为损失函数
         optimizer = optim.Adam(model.parameters(), lr=0.05)
@@ -100,7 +77,7 @@ class TrainProcess:
             for epoch in pbar:
                 optimizer.zero_grad()
 
-                predictions = model(self.data)  # forward
+                predictions = model(self.feature_tensor)  # forward
 
                 loss = criterion(predictions, self.return_data)  # loss
 
@@ -117,6 +94,41 @@ class TrainProcess:
 
         return model, losses
 
+    def train_gnn_gru_model(self, in_channels, out_channels, hidden_size, hidden_size_gru):
+        """
+        用gnn去聚合邻近节点的信息, 并且结合gru进行时序分析
+        :return:
+        """
+        industry_info = pd.read_csv('/Volumes/E/quant_data/zjw300_code.csv', index_col=0)
+        edgeinfo = EdgeInfo(self.feature_tensor)
+        edge_index, edge_index_matrix = edgeinfo.get_edge_index_by_industry(industry_info, self.stock_ids)
+
+        model = GNNAndGRU(self.num_stocks, in_channels, out_channels, hidden_size, hidden_size_gru, edge_index)
+        optimizer = optim.Adam(model.parameters(), lr=0.1)
+        # loss_func = nn.L1Loss()  # 二元交叉熵损失函数
+        loss_func = nn.MSELoss()
+
+        td = TimeseriesDataset(self.return_tensor, in_channels, out_channels)
+        x_tensor, y_tensor = td.x_timeseries, td.y_timeseries
+
+        # 转化为batch进行训练
+        dataset = TensorDataset(x_tensor, y_tensor)
+        data_loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+        model.train()
+        losses = []
+        for epoch in range(self.num_epochs):
+            for x, y in data_loader:
+                optimizer.zero_grad()
+                pred, A_hats = model(x)
+                loss = loss_func(pred.view(y.shape), y)
+                loss.backward()
+                optimizer.step()
+                losses.append(loss)
+            print(f"Epoch {epoch}, Loss: {loss.item()}")
+
+        return model, losses
+
 
 if __name__ == '__main__':
     stock_data = StockData(
@@ -126,14 +138,19 @@ if __name__ == '__main__':
     )
     data = stock_data.daily_data_from_h5()
     return_data = stock_data.calculate_return(data)
-    dp = DataProcess(data, return_data, stock_data.features, stock_data.dates, stock_data.stock_ids)
+    # dp = DataProcess(data, return_data, stock_data.features, stock_data.dates, stock_data.stock_ids)
+    # over_threshold_stocks = dp.over_threshold_stocks
+    # data = data.drop(columns=over_threshold_stocks)   # data -> dataframe
 
     num_epochs = 100
-    data1 = dp.data1[:, :, :]
-    data2 = dp.data2[:, :]
+    batch_size = 1
+    # data1 = dp.data1[:, :, :]
+    # data2 = dp.data2[:, :]
 
-    tp = TrainProcess(data1, data2, num_epochs)
+    tp = TrainProcess(data, return_data, stock_data.features, stock_data.dates, stock_data.stock_ids, num_epochs, batch_size)
 
-    model, losses = tp.apply_to_model()
+    # model, losses = tp.apply_to_model()
+    #
+    # plt.scatter(np.arange(len(losses)), losses)
 
-    plt.scatter(np.arange(len(losses)), losses)
+    model, losses = tp.train_gnn_gru_model()
